@@ -5583,6 +5583,11 @@ unsafe fn warm_once<G>(dev: &ID3D12Device, r: &super::pso_journal::Replay, drive
         super::pso_journal::Replay::Compute(d, _) => {
             let cs = shader_bytes(&d.CS).filter(|c| is_console(c)).ok_or("no console CS")?;
             let compiled = console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this))?;
+            // the title builds a split program as its pieces (`dispatch_chain`, with their own
+            // root signature): the whole program made here would be one it never asks for
+            if compiled.dispatch_chain.is_some() {
+                return Err("a split compute program (dispatch chain) – left to the title".into());
+            }
             let rs = abi_rs_for(this, &compiled.samplers).ok_or("no root signature")?;
             let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(&**d);
             copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
