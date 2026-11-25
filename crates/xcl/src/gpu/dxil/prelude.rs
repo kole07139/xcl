@@ -36,11 +36,21 @@ impl Lw {
     /// MODE[3:2] the software conversion with the current mode.
     pub fn to_f16(&mut self, e: Value) -> Value {
         if self.dyn_rm {
-            let rm = self.rd(super::lower::VAR_FP16_RM);
-            return self.f32_to_f16_rm(e, rm);
+            return self.to_f16_rounded(e);
         }
         let h = self.s.f32_to_f16(e);
         self.andc(h, 0xFFFF)
+    }
+    /// Round an exact binary32 input to binary16 in the selected RDNA mode
+    /// (`recomp/emit.rs` `to_f16_rounded_expr`). Legacy `f32tof16` uses
+    /// round-toward-zero; the default RDNA mode is round-to-nearest-even.
+    pub fn to_f16_rounded(&mut self, e: Value) -> Value {
+        if self.dyn_rm {
+            let rm = self.rd(super::lower::VAR_FP16_RM);
+            self.f32_to_f16_rm(e, rm)
+        } else {
+            self.f32_to_f16_rne(e)
+        }
     }
     /// `f16_rtz`: binary16 rounded toward zero.
     pub fn f16_rtz(&mut self, f: Value) -> Value {
@@ -98,6 +108,44 @@ impl Lw {
         let s = self.lor(a, b);
         let ei = self.ftosi(e);
         self.selc(s, 0, ei)
+    }
+    pub fn frexp_exp_f32(&mut self, bits: Value, legacy_src: impl FnOnce(&mut Self) -> Value) -> Value {
+        use super::lower_round::{F32_DENORM_INPUT_WRITTEN, VAR_F32_MODE};
+        let mode = if self.track_frexp_denorm { self.rd(VAR_F32_MODE) } else { self.c(0) };
+        let written = self.andc(mode, F32_DENORM_INPUT_WRITTEN);
+        let known = self.nz(written);
+        let legacy = |lw: &mut Self| {
+            let x = legacy_src(lw);
+            lw.frexp_exp(x)
+        };
+        match self.s.m.const_u64(known) {
+            Some(0) => legacy(self),
+            Some(1) => self.frexp_exp_f32_bits(bits, mode),
+            _ => {
+                let result = self.frexp_exp_f32_bits(bits, mode);
+                let old = legacy(self);
+                self.sel(known, result, old)
+            }
+        }
+    }
+
+    fn frexp_exp_f32_bits(&mut self, bits: Value, mode: Value) -> Value {
+        let e8 = self.lshrc(bits, 23);
+        let exp = self.andc(e8, 0xFF);
+        let fraction = self.andc(bits, 0x7F_FFFF);
+        let normal = self.addc(exp, (-126i32) as u32);
+        // firstbithigh(0) returns -1; a zero fraction always produces 0 below.
+        let top = self.firstbithigh(fraction);
+        let subnormal = self.addc(top, (-148i32) as u32);
+        let empty = self.cmpc(Pred::Eq, fraction, 0);
+        let keep = self.andc(mode, 0x10);
+        let flush = self.cmpc(Pred::Eq, keep, 0);
+        let zero = self.lor(empty, flush);
+        let low = self.selc(zero, 0, subnormal);
+        let no_exp = self.cmpc(Pred::Eq, exp, 0);
+        let finite = self.sel(no_exp, low, normal);
+        let special = self.cmpc(Pred::Eq, exp, 0xFF);
+        self.selc(special, 0, finite)
     }
     /// `ldexp_f`: exact x · 2^n on the bits.
     pub fn ldexp_f(&mut self, x: Value, n: Value) -> Value {
@@ -174,6 +222,7 @@ impl Lw {
     }
     /// `mad_nf`: separately rounded multiply and add (`precise`).
     pub fn mad_nf(&mut self, a: Value, b: Value, c: Value) -> Value {
+        self.s.require(super::shader::Feature::DisableMathRefactoring);
         let p = self.fmul(a, b);
         self.fadd(p, c)
     }
@@ -484,5 +533,156 @@ impl Lw {
         let eq = self.cmpc(Pred::Eq, h, 0x7FF0_0000);
         let lz = self.cmpc(Pred::Eq, l, 0);
         self.land(eq, lz)
+    }
+}
+
+#[cfg(test)]
+mod disable_math_refactoring_tests {
+    use super::super::kernel::{self, KernelOptions};
+    use super::super::validate;
+    use crate::gpu::rdna2;
+    use crate::gpu::recomp::PsInterface;
+
+    fn opts() -> KernelOptions {
+        KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 }
+    }
+
+    /// Parses the entry-point shader flags (`!dx.entryPoints` property tag `0`)
+    /// from DXIL disassembly. Returns `0` if tag `0` is absent.
+    fn entry_point_flags(dis: &str) -> u64 {
+        let props_id = dis
+            .lines()
+            .find_map(|line| {
+                if !line.contains("!\"main\"") {
+                    return None;
+                }
+                let start = line.rfind('!')?;
+                let rest = &line[start..];
+                let end = rest.find(|c: char| !c.is_ascii_digit() && c != '!').unwrap_or(rest.len());
+                Some(&rest[..end])
+            })
+            .expect("entry point metadata node");
+        let props_line = dis
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{props_id} =")))
+            .expect("entry point properties node");
+        let marker = "i32 0, i64 ";
+        let Some(idx) = props_line.find(marker) else {
+            return 0;
+        };
+        let rest = &props_line[idx + marker.len()..];
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        rest[..end].parse::<u64>().expect("valid u64 flags")
+    }
+
+    fn v_mad_f32(vdst: u64, s0: u64, s1: u64, s2: u64) -> Vec<u8> {
+        rdna2::encode("V_MAD_F32", "ENC_VOP3", &[("VDST", vdst), ("SRC0", 256 + s0), ("SRC1", 256 + s1), ("SRC2", 256 + s2)], None).unwrap()
+    }
+
+    fn v_mac_f32(vdst: u64, s0: u64, s1: u64) -> Vec<u8> {
+        rdna2::encode("V_MAC_F32", "ENC_VOP2", &[("VDST", vdst), ("SRC0", 256 + s0), ("VSRC1", s1)], None).unwrap()
+    }
+
+    fn v_fma_f32(vdst: u64, s0: u64, s1: u64, s2: u64) -> Vec<u8> {
+        rdna2::encode("V_FMA_F32", "ENC_VOP3", &[("VDST", vdst), ("SRC0", 256 + s0), ("SRC1", 256 + s1), ("SRC2", 256 + s2)], None).unwrap()
+    }
+
+    fn v_add_f32(vdst: u64, s0: u64, s1: u64) -> Vec<u8> {
+        rdna2::encode("V_ADD_F32", "ENC_VOP2", &[("VDST", vdst), ("SRC0", 256 + s0), ("VSRC1", s1)], None).unwrap()
+    }
+
+    fn s_endpgm() -> Vec<u8> {
+        rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap()
+    }
+
+    #[test]
+    fn compute_unfused_mad_sets_disable_math_refactoring() {
+        for inst in [v_mad_f32(3, 0, 1, 2), v_mac_f32(2, 0, 1)] {
+            let mut code = inst;
+            code.extend(s_endpgm());
+            let dxil = kernel::translate(&code, opts()).expect("translate compute unfused mad");
+            validate::validate(&dxil).expect("dxil validate compute unfused mad");
+            let dis = validate::disassemble(&dxil).expect("disassemble compute unfused mad");
+            let flags = entry_point_flags(&dis);
+            assert_ne!(flags & (1 << 1), 0, "expected DisableMathRefactoring (bit 1) in flags={flags:#x}:\n{dis}");
+        }
+    }
+
+    fn ps_with_pos() -> PsInterface {
+        use crate::gpu::dxbc::SigElement;
+        // SPI_PS_INPUT_ENA bits 8..11: SV_Position.xyzw in v0..v3; SV_Target0 so EXP TGT=0 stays live.
+        PsInterface {
+            inputs: vec![SigElement { name: "SV_Position".into(), index: 0, system_value: 1, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
+            outputs: vec![SigElement { name: "SV_Target".into(), index: 0, system_value: 64, component_type: 3, register: 0, mask: 0xF, rw_mask: 0xF, stream: 0 }],
+            input_ena: 0x0F00,
+            attrs: None,
+        }
+    }
+
+    #[test]
+    fn pixel_unfused_mad_sets_disable_math_refactoring() {
+        let mut code = v_mad_f32(3, 0, 1, 2);
+        code.extend(rdna2::encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 3), ("VSRC1", 3), ("VSRC2", 3), ("VSRC3", 3), ("DONE", 1), ("VM", 1)], None).unwrap());
+        code.extend(s_endpgm());
+        let ps = ps_with_pos();
+        let k = kernel::translate_pixel(&code, opts(), &ps).expect("translate pixel unfused mad");
+        validate::validate(&k.dxil).expect("dxil validate pixel unfused mad");
+        let dis = validate::disassemble(&k.dxil).expect("disassemble pixel unfused mad");
+        assert!(dis.contains("fmul float") && dis.contains("fadd float"), "expected live fmul+fadd:\n{dis}");
+        let flags = entry_point_flags(&dis);
+        assert_ne!(flags & (1 << 1), 0, "expected DisableMathRefactoring (bit 1) in pixel flags={flags:#x}:\n{dis}");
+    }
+
+    #[test]
+    fn fmad_suppresses_disable_math_refactoring_in_compute_and_pixel() {
+        let mut cs_code = v_mad_f32(3, 0, 1, 2);
+        cs_code.extend(v_fma_f32(4, 0, 1, 3));
+        cs_code.extend(s_endpgm());
+        let dxil = kernel::translate(&cs_code, opts()).expect("translate compute mad+fma");
+        validate::validate(&dxil).expect("dxil validate compute mad+fma");
+        let dis = validate::disassemble(&dxil).expect("disassemble compute mad+fma");
+        assert!(dis.contains("dx.op.tertiary.f32(i32 46,"), "expected live FMad in compute shader:\n{dis}");
+        let flags = entry_point_flags(&dis);
+        assert_eq!(flags & (1 << 1), 0, "DisableMathRefactoring must be omitted when FMad is used (flags={flags:#x}):\n{dis}");
+
+        let mut ps_code = v_mad_f32(3, 0, 1, 2);
+        ps_code.extend(v_fma_f32(4, 0, 1, 3));
+        ps_code.extend(rdna2::encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None).unwrap());
+        ps_code.extend(s_endpgm());
+        let ps = ps_with_pos();
+        let k = kernel::translate_pixel(&ps_code, opts(), &ps).expect("translate pixel mad+fma");
+        validate::validate(&k.dxil).expect("dxil validate pixel mad+fma");
+        let dis = validate::disassemble(&k.dxil).expect("disassemble pixel mad+fma");
+        assert!(dis.contains("dx.op.tertiary.f32(i32 46,"), "expected live FMad in pixel shader:\n{dis}");
+        let flags = entry_point_flags(&dis);
+        assert_eq!(flags & (1 << 1), 0, "DisableMathRefactoring must be omitted in pixel shader when FMad is used (flags={flags:#x}):\n{dis}");
+    }
+
+    #[test]
+    fn plain_float_add_does_not_set_disable_math_refactoring() {
+        let mut code = v_add_f32(2, 0, 1);
+        code.extend(s_endpgm());
+        let dxil = kernel::translate(&code, opts()).expect("translate compute v_add_f32");
+        validate::validate(&dxil).expect("dxil validate compute v_add_f32");
+        let dis = validate::disassemble(&dxil).expect("disassemble compute v_add_f32");
+        let flags = entry_point_flags(&dis);
+        assert_eq!(flags & (1 << 1), 0, "plain v_add_f32 must not set DisableMathRefactoring (flags={flags:#x}):\n{dis}");
+    }
+
+    #[test]
+    fn dead_fmad_eliminated_by_dce_still_allows_disable_math_refactoring() {
+        // v5 is written by v_fma_f32 and never read, so DCE eliminates the FMad
+        // while v4's v_mad_f32 stays live through the pixel export.
+        let mut code = v_fma_f32(5, 0, 1, 2);
+        code.extend(v_mad_f32(4, 0, 1, 2));
+        code.extend(rdna2::encode("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)], None).unwrap());
+        code.extend(s_endpgm());
+        let ps = ps_with_pos();
+        let k = kernel::translate_pixel(&code, opts(), &ps).expect("translate pixel dead-fma+mad");
+        validate::validate(&k.dxil).expect("dxil validate pixel dead-fma+mad");
+        let dis = validate::disassemble(&k.dxil).expect("disassemble pixel dead-fma+mad");
+        assert!(!dis.contains("dx.op.tertiary.f32(i32 46,"), "expected dead FMad to be eliminated by DCE:\n{dis}");
+        let flags = entry_point_flags(&dis);
+        assert_ne!(flags & (1 << 1), 0, "post-DCE dead FMad should not suppress DisableMathRefactoring (flags={flags:#x}):\n{dis}");
     }
 }

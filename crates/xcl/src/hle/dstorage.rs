@@ -31,6 +31,9 @@
 
 #![allow(non_snake_case)]
 
+#[path = "dstorage/parallel.rs"]
+mod parallel;
+
 use std::ffi::c_void;
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::AsRawHandle;
@@ -844,29 +847,32 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
+fn note_request(r: &Request) {
+    let n = r.destination_size as usize;
+    // the first requests: where a title's data goes and how it is packed
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    REQUESTS.fetch_add(1, Ordering::Relaxed);
+    BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    if k < 16 || k.is_power_of_two() {
+        crate::xlog_info!(
+            "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
+            r.options,
+            if r.memory_source() { "memory" } else { "file" },
+            if r.zlib() { ", zlib" } else { "" },
+            r.destination,
+            if r.dest_physical_pages() { " (physical pages)" } else { "" },
+            r.destination_page_offset,
+            r.source_size,
+            r.intermediate_size
+        );
+    }
+}
+
 /// Run a request; the destination gets the bytes or nothing.
 unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
-    {
-        // the first requests: where a title's data goes and how it is packed
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let k = N.fetch_add(1, Ordering::Relaxed);
-        REQUESTS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(n as u64, Ordering::Relaxed);
-        if k < 16 || k.is_power_of_two() {
-            crate::xlog_info!(
-                "DirectStorage: request #{k}: options {:#x} ({} source{}), destination {:#x}{} ({n} bytes, page offset {}), source size {}, intermediate {}",
-                r.options,
-                if r.memory_source() { "memory" } else { "file" },
-                if r.zlib() { ", zlib" } else { "" },
-                r.destination,
-                if r.dest_physical_pages() { " (physical pages)" } else { "" },
-                r.destination_page_offset,
-                r.source_size,
-                r.intermediate_size
-            );
-        }
-    }
+    note_request(r);
     if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
         return Err(E_ACCESS_VIOLATION);
     }
@@ -925,11 +931,19 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         // read again now. A retail title keeps its page arrays in its own tables and fills an
         // entry after EnqueueRequest – its streaming requests were refused by the thousand
         // with page 0. An array that had its pages at enqueue stays as it was snapshotted
-        // (titles also pass arrays on the stack).
+        // (titles also pass arrays on the stack). The title keeps an array with such an entry
+        // until the request is done: one it has freed or reused meanwhile cannot be told from
+        // a late fill. Read like the snapshot (`read_own`): an array unmapped since then fails
+        // the request instead of faulting in this worker (#476).
         let late: Vec<usize>;
-        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
-            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
-            &late[..]
+        let pages = if pages.contains(&0) {
+            let mut now = vec![0usize; pages.len()];
+            if read_own(r.destination as usize, now.as_mut_ptr() as *mut u8, std::mem::size_of_val(pages)) {
+                late = pages.iter().zip(&now).map(|(&then, &now)| if then != 0 { then } else { now }).collect();
+                &late[..]
+            } else {
+                pages
+            }
         } else {
             pages
         };
@@ -1024,6 +1038,10 @@ struct QueueInner {
     errors: Mutex<(u32, Option<FirstError>)>,
     /// `XCL_DSTORAGE_BCPACK_FILL` when the queue was made
     bcpack_fill: AtomicBool,
+    #[cfg(test)]
+    pool_override: OnceLock<Option<Arc<parallel::DecompressPool>>>,
+    #[cfg(test)]
+    test_hook: OnceLock<parallel::TestHook>,
 }
 
 impl QueueInner {
@@ -1087,59 +1105,69 @@ impl QueueInner {
             }
         }
         let _active = ActiveGuard(self);
+        if let Some(pool) = parallel::pool_for(self) {
+            parallel::run(self, pool, rx);
+            return;
+        }
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
         for batch in rx {
-            for e in batch {
-                if self.closed.load(Ordering::Acquire) {
-                    if let Entry::Status(s, i) = e {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(E_QUEUE_CLOSED, Ordering::Release);
-                        }
-                    }
-                    continue;
+            for entry in batch {
+                self.run_entry(entry, &mut since_status);
+            }
+        }
+    }
+
+    fn update_error(&self, hr: HRESULT, req: Request, file: Option<&FileInner>, since_status: &mut HRESULT) {
+        self.fail(hr, req, file);
+        if *since_status >= 0 {
+            *since_status = hr;
+        }
+    }
+
+    #[inline]
+    fn run_entry(&self, e: Entry, since_status: &mut HRESULT) {
+        if self.closed.load(Ordering::Acquire) {
+            if let Entry::Status(s, i) = e {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(E_QUEUE_CLOSED, Ordering::Release);
                 }
-                match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
-                        if self.is_cancelled(seq, req.tag) {
-                            // Cancelled requests are skipped without affecting status or error record.
-                            continue;
-                        }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
-                            self.fail(hr, req, file.as_deref());
-                            if since_status >= 0 {
-                                since_status = hr;
-                            }
-                        }
-                    }
-                    Entry::Refused { seq, hr, req, file, fill } => {
-                        // a cancelled request is no failure, refused or not
-                        if self.is_cancelled(seq, req.tag) {
-                            continue;
-                        }
-                        if let Some(t) = &fill {
-                            // the destination gets solid blocks; the request still fails
-                            unsafe { bcpack_fill(&req, t) };
-                        }
-                        self.fail(hr, req, file.as_deref());
-                        if since_status >= 0 {
-                            since_status = hr;
-                        }
-                    }
-                    Entry::Status(s, i) => {
-                        if let Some(slot) = s.slots.get(i as usize) {
-                            slot.store(since_status, Ordering::Release);
-                        }
-                        since_status = S_OK;
-                    }
-                    Entry::Signal(fence, value) => unsafe {
-                        fence.signal(value);
-                    },
-                    #[cfg(test)]
-                    Entry::Gate(b) => {
-                        b.wait();
-                    }
+            }
+            return;
+        }
+        match e {
+            Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                if self.is_cancelled(seq, req.tag) {
+                    // Cancelled requests are skipped without affecting status or error record.
+                    return;
                 }
+                if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                    self.update_error(hr, req, file.as_deref(), since_status);
+                }
+            }
+            Entry::Refused { seq, hr, req, file, fill } => {
+                // a cancelled request is no failure, refused or not
+                if self.is_cancelled(seq, req.tag) {
+                    return;
+                }
+                if let Some(t) = &fill {
+                    // the destination gets solid blocks; the request still fails
+                    unsafe { bcpack_fill(&req, t) };
+                }
+                self.update_error(hr, req, file.as_deref(), since_status);
+            }
+            Entry::Status(s, i) => {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(*since_status, Ordering::Release);
+                }
+                *since_status = S_OK;
+            }
+            Entry::Signal(fence, value) => unsafe {
+                fence.signal(value);
+            },
+            #[cfg(test)]
+            Entry::Gate(b) => {
+                b.wait();
             }
         }
     }
@@ -1257,6 +1285,10 @@ unsafe extern "system" fn factory_create_queue(_p: *mut c_void, desc: *const u8,
         error_event: ev as usize,
         errors: Mutex::new((0, None)),
         bcpack_fill: AtomicBool::new(bcpack_fill_from_env()),
+        #[cfg(test)]
+        pool_override: OnceLock::new(),
+        #[cfg(test)]
+        test_hook: OnceLock::new(),
     });
     let o = new_object(queue_vtbl(), inner);
     let hr = queue_qi(o, riid, out);
@@ -1423,6 +1455,7 @@ unsafe extern "system" fn queue_close(p: *mut c_void) {
         }
         // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
     }
+    parallel::wake_waiters(q);
     // Wait outside queue locks so no in-flight worker request can still touch caller buffers
     // after `Close()` returns (including for concurrent `Close()` callers).
     let (lock, cvar) = &q.worker_active;
@@ -2204,6 +2237,77 @@ mod tests {
             MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
             windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// A destination page array with a deferred (0) entry whose memory is decommitted while
+    /// requests are on the queue (#476): the worker's reread fails the request
+    /// (E_ACCESS_VIOLATION) and never faults, whatever the array's state at that moment.
+    #[test]
+    fn a_deferred_page_array_unmapped_under_the_worker_fails_the_request() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        const REQUESTS: u32 = 20_000;
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&64u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 1, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+
+            // the title's page table: one entry, still 0 (the page comes later), on a page of its own
+            let table = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(table, 0);
+            let data = [0x5Au8; 16];
+
+            // the title frees and reuses that memory while the requests wait for their turn
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let toggler = {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        VirtualFree(table as *mut c_void, 0x1000, MEM_DECOMMIT);
+                        VirtualAlloc(table as *const c_void, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+                    }
+                })
+            };
+            for i in 0..REQUESTS {
+                enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table as u64, 0, 16, data.as_ptr() as u64, 0, 16, 0, 0).as_ptr());
+                if i % 16 == 15 {
+                    submit(q);
+                }
+            }
+            status(q, s, 0);
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, 0) && t.elapsed().as_secs() < 60 {
+                std::thread::yield_now();
+            }
+            stop.store(true, Ordering::Relaxed);
+            toggler.join().unwrap();
+            assert!(complete(s, 0), "the queue did not get through its requests");
+            // refused at enqueue (array unreadable then) or failed at the reread: never a page
+            assert_eq!(hresult(s, 0), E_ACCESS_VIOLATION);
+
+            VirtualFree(table as *mut c_void, 0, MEM_RELEASE);
             queue_close(q);
             queue_release(q);
             status_release(s);

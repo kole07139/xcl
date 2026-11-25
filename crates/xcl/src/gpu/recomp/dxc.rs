@@ -258,6 +258,23 @@ mod version_tests {
         assert_eq!(lib(0, 0, "10.0.1.2").to_string(), "(file 10.0.1.2)");
     }
 
+    #[test]
+    fn a_source_compiled_at_o0_has_no_debug_noops() {
+        if location().is_err() {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        }
+        let src = "RWByteAddressBuffer m : register(u0);\n[numthreads(1, 1, 1)] void main() { uint a = m.Load(0); uint b = a + 1u; m.Store(4, b); }\n";
+        let padded = format!("{src}{}", " ".repeat(8 * 1024 * 1024));
+        let with_noops = compile(src, "main", "cs_6_6", &["-O0"]).unwrap();
+        let without = compile(src, "main", "cs_6_6", &["-O0", "-opt-disable", "debug-nops"]).unwrap();
+        if without.len() == with_noops.len() {
+            println!("this DXC has no debug-nops switch");
+            return;
+        }
+        assert_eq!(compile(&padded, "main", "cs_6_6", &[]).unwrap().len(), without.len());
+    }
+
     /// The DXC of this PC, when it has one: what `report.json` says of it.
     #[test]
     fn the_loaded_dxc_is_identified() {
@@ -477,6 +494,10 @@ pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
+/// HLSL longer than this is compiled at -O0 (`compile_here`): a console compute program this big
+/// takes the direct DXIL translator instead (`pso::compile_console_shader`).
+pub const UNOPTIMISED_ABOVE: usize = 8 * 1024 * 1024;
+
 fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
     let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
@@ -488,8 +509,8 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     // -O1 from 1 MB on: the same DXIL size at a quarter less time (a retail game's 4.8 MB HLSL of
     // a 19 600-instruction CS: 13.5 s instead of 17.7 at -O3; -O0 10.6 s, but twice the DXIL)
     if !extra.iter().any(|a| a.starts_with("-O")) {
-        if src.len() > 8 * 1024 * 1024 {
-            args.push(crate::util::wide("-O0"));
+        if src.len() > UNOPTIMISED_ABOVE {
+            args.extend(["-O0", "-opt-disable", "debug-nops"].map(crate::util::wide));
         } else if src.len() > 1024 * 1024 {
             args.push(crate::util::wide("-O1"));
         }
@@ -726,7 +747,7 @@ fn cached_file(file: &Path) -> Option<Vec<u8>> {
 
 /// Cheap validation before handing a cached blob to D3D12. DXIL uses the DXBC
 /// container header: magic, hash, version, total size, chunk count and offsets.
-fn valid_dxil_container(blob: &[u8]) -> bool {
+pub(super) fn valid_dxil_container(blob: &[u8]) -> bool {
     let rd = |at: usize| {
         blob.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
     };
