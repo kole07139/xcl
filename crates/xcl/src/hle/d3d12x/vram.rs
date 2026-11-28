@@ -517,6 +517,59 @@ impl TilePool {
     }
 }
 
+/// `XCL_TEXTURE_SYSMEM=1` (off by default; with `level_pages`): the levels of streamed textures
+/// get their pages from pool heaps in system memory (custom heaps in L0, which the GPU samples
+/// over PCIe); render targets and other textures keep video memory. A page of those heaps has
+/// `SYS_TILE` in its heap index.
+const SYS_TILE: u32 = 1 << 31;
+
+fn texture_sysmem() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = level_pages() && std::env::var("XCL_TEXTURE_SYSMEM").is_ok_and(|v| v.trim() == "1");
+        if on {
+            crate::xlog_info!("D3D12.X: XCL_TEXTURE_SYSMEM=1 - the levels of streamed textures in system memory");
+        }
+        on
+    })
+}
+
+/// One 64 MiB system-memory heap for the pages of streamed texture levels (`texture_sysmem`).
+unsafe fn alloc_sys_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
+    let desc = D3D12_HEAP_DESC {
+        SizeInBytes: POOL_PAGES as u64 * PAGE as u64,
+        Properties: D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_CUSTOM,
+            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+            ..Default::default()
+        },
+        Alignment: 0,
+        Flags: D3D12_HEAP_FLAG_NONE,
+    };
+    let mut heap: Option<ID3D12Heap> = None;
+    if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+        crate::xlog_warn!("D3D12.X: no system-memory pool heap for texture levels ({e})");
+        return None;
+    }
+    heap
+}
+
+/// The pool a freed page's tile cools in: the system-memory pools for one with `SYS_TILE`.
+fn tile_is_sys(tile: Tile) -> bool {
+    tile.0 & SYS_TILE != 0
+}
+
+/// A page's tile freed at `at` cools in its own pools: `sys_pool` (by its index there) for one
+/// with `SYS_TILE`, else `pool`.
+fn cool_in(pool: &mut TilePool, sys_pool: &mut TilePool, tile: Tile, at: std::time::Instant) {
+    if tile_is_sys(tile) {
+        sys_pool.push_cooling((tile.0 & !SYS_TILE, tile.1), at);
+    } else {
+        pool.push_cooling(tile, at);
+    }
+}
+
 /// Allocate one 64 MiB default heap for `Pages`.
 unsafe fn alloc_pool_heap(dev: &ID3D12Device) -> Option<ID3D12Heap> {
     let desc = D3D12_HEAP_DESC {
@@ -605,6 +658,9 @@ struct Pages {
     /// pool heaps by `Tile` index (a reclaimed one's slot is empty, as `TilePool::live` has it)
     pools: PoolHeaps,
     pool: TilePool,
+    /// the system-memory pools of streamed texture levels (`texture_sysmem`; indices without `SYS_TILE`)
+    sys_pools: PoolHeaps,
+    sys_pool: TilePool,
     /// title page address → its video memory
     pages: std::collections::HashMap<usize, Page>,
     /// extra / sub-64 KiB tiles keyed by `(va, tile_index)` so repeated placements at the same
@@ -651,6 +707,8 @@ impl Pages {
             last_reclaim: std::time::Instant::now(),
             pools: PoolHeaps::new(),
             pool: TilePool::new(),
+            sys_pools: PoolHeaps::new(),
+            sys_pool: TilePool::new(),
             pages: std::collections::HashMap::new(),
             extra_pages: std::collections::HashMap::new(),
             idle: std::collections::VecDeque::new(),
@@ -666,7 +724,11 @@ impl Pages {
 
     /// Pages no resource used for `IDLE` go back to the pools.
     fn sweep(&mut self, now: std::time::Instant) {
-        sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut self.pool.cooling, now);
+        let mut cooled = std::collections::VecDeque::new();
+        sweep_idle(&mut self.idle, &mut self.pages, &mut self.extra_pages, &mut cooled, now);
+        for (t, at) in cooled {
+            self.cool(t, at);
+        }
     }
 
     /// Sweep expired idle pages, drain cooled tiles, and reclaim any completely empty 64 MiB
@@ -675,6 +737,7 @@ impl Pages {
     fn sweep_and_reclaim(&mut self, now: std::time::Instant) -> Vec<ID3D12Heap> {
         self.sweep(now);
         self.pool.drain_cooling(now);
+        self.sys_pool.drain_cooling(now);
         let reclaimed_ids = self.pool.reclaim_empty_heaps(keep_spare_pools(), POOL_PAGES);
         let mut dropped = Vec::with_capacity(reclaimed_ids.len());
         for idx in reclaimed_ids {
@@ -706,7 +769,8 @@ impl Pages {
         for i in 0..self.scratch_heaps.len() {
             let h = self.scratch_heaps[i];
             // (a tile is only ever of a heap the pool has: `TilePool::reclaim_empty_heaps`)
-            let Some(heap) = self.pools.get(h as usize) else { continue };
+            let heap = if tile_is_sys((h, 0)) { self.sys_pools.get((h & !SYS_TILE) as usize) } else { self.pools.get(h as usize) };
+            let Some(heap) = heap else { continue };
             let ranges = heap_ranges_trimmed(h, tiles);
             if ranges.is_empty() {
                 continue;
@@ -771,6 +835,11 @@ impl Pages {
         let _ = self.queue.Signal(&self.fence, self.value);
     }
 
+    /// A page's tile freed: it cools in its own pools.
+    fn cool(&mut self, tile: Tile, at: std::time::Instant) {
+        cool_in(&mut self.pool, &mut self.sys_pool, tile, at);
+    }
+
     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
         for a in used {
             if let Some(p) = self.pages.get_mut(&a) {
@@ -778,7 +847,7 @@ impl Pages {
                 if p.users == 0 {
                     if immediate_cool {
                         if let Some(p) = self.pages.remove(&a) {
-                            self.pool.push_cooling(p.tile, now);
+                            self.cool(p.tile, now);
                         }
                     } else {
                         p.idle_since = Some(now);
@@ -793,7 +862,7 @@ impl Pages {
                 if p.users == 0 {
                     if immediate_cool {
                         if let Some(p) = self.extra_pages.remove(&k) {
-                            self.pool.push_cooling(p.tile, now);
+                            self.cool(p.tile, now);
                         }
                     } else {
                         p.idle_since = Some(now);
@@ -812,6 +881,12 @@ impl Pages {
     /// `bind` for the tiles `range` of the resource's `total`, which start at subresource `sub`.
     #[allow(clippy::too_many_arguments)]
     unsafe fn bind_range(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
+        self.bind_range_in(dev, res, va, console_bytes, total, sub, range, false)
+    }
+
+    /// `bind_range`, its new pages from the system-memory pools with `sys` (`texture_sysmem`).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn bind_range_in(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, va: usize, console_bytes: Option<u64>, total: u32, sub: u32, range: std::ops::Range<usize>, sys: bool) -> Option<(Vec<usize>, Vec<(usize, usize)>)> {
         let (first, own) = (total > 0).then(|| owned_pages(va, console_bytes, total as usize)).flatten()?;
         let now = std::time::Instant::now();
         self.sweep(now);
@@ -825,18 +900,33 @@ impl Pages {
                 self.extra_pages.get(&(va, i)).map(|p| p.tile.0)
             };
             match existing {
-                Some(h) if preferred.is_none() => preferred = Some(h),
+                Some(h) if preferred.is_none() && tile_is_sys((h, 0)) == sys => preferred = Some(h & !SYS_TILE),
                 Some(_) => {}
                 None => missing += 1,
             }
         }
 
-        let pools = &mut self.pools;
-        let pool = &mut self.pool;
-        let fresh = pool.take_batch(missing, preferred, now, POOL_PAGES, || {
-            let heap = alloc_pool_heap(dev)?;
-            Some(pools.push_heap(heap))
-        })?;
+        // (with `sys` the system-memory pools; none there: video memory, as without it)
+        let fresh = if sys {
+            let pools = &mut self.sys_pools;
+            self.sys_pool.take_batch(missing, preferred, now, POOL_PAGES, || {
+                let heap = alloc_sys_pool_heap(dev)?;
+                Some(pools.push_heap(heap))
+            }).map(|v| v.into_iter().map(|(h, t)| (h | SYS_TILE, t)).collect::<Vec<_>>())
+        } else {
+            None
+        };
+        let fresh = match fresh {
+            Some(f) => f,
+            None => {
+                let pools = &mut self.pools;
+                let pool = &mut self.pool;
+                pool.take_batch(missing, preferred.filter(|_| !sys), now, POOL_PAGES, || {
+                    let heap = alloc_pool_heap(dev)?;
+                    Some(pools.push_heap(heap))
+                })?
+            }
+        };
         let mut fresh_iter = fresh.into_iter();
 
         let mut tiles = Vec::with_capacity(range.len());
@@ -1413,7 +1503,7 @@ pub(super) unsafe fn map_levels(res: &ID3D12Resource, levels: Option<&[u32]>) ->
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { return Vec::new() };
         let mut fresh = Vec::new();
         for (k, sub, first, n, levels) in todo {
-            let Some((used, used_extra)) = pages.bind_range(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize) else { continue };
+            let Some((used, used_extra)) = pages.bind_range_in(dev, res, va, console_bytes, total, sub, first as usize..(first + n) as usize, texture_sysmem()) else { continue };
             let Some(t) = pages.targets.get_mut(&key) else { return fresh };
             t.used.extend(used);
             t.used_extra.extend(used_extra);
@@ -1650,6 +1740,27 @@ mod tests {
         assert_eq!(w, vec![(1, 1), (1, 2)]);
         remove_once_each(&mut w, &[(1, 2), (1, 2)]);
         assert_eq!(w, vec![(1, 1)]);
+    }
+
+    /// A page of the system-memory pools (`SYS_TILE`) is told apart from one of video memory with
+    /// the same heap slot, and each, freed, cools in its own pools, by its index there.
+    #[test]
+    fn a_system_memory_page_is_told_apart_and_cools_in_its_own_pool() {
+        let video: Tile = (7, 3);
+        let system: Tile = (SYS_TILE | 7, 3);
+        assert!(!tile_is_sys(video) && tile_is_sys(system));
+        let (mut pool, mut sys_pool) = (TilePool::new(), TilePool::new());
+        pool.add_heap_at(7, POOL_PAGES);
+        sys_pool.add_heap_at(7, POOL_PAGES);
+        let t0 = std::time::Instant::now();
+        cool_in(&mut pool, &mut sys_pool, video, t0);
+        cool_in(&mut pool, &mut sys_pool, system, t0);
+        assert_eq!(pool.cooling.iter().map(|&(t, _)| t).collect::<Vec<_>>(), vec![video]);
+        assert_eq!(sys_pool.cooling.iter().map(|&(t, _)| t).collect::<Vec<_>>(), vec![(7, 3)], "by its index there");
+        let (free, sys_free) = (pool.free_total, sys_pool.free_total);
+        pool.drain_cooling(t0 + COOL);
+        sys_pool.drain_cooling(t0 + COOL);
+        assert_eq!((pool.free_total, sys_pool.free_total), (free + 1, sys_free + 1), "each back in its own pool");
     }
 
     /// The levels of a texture with lazy levels: a group of tiles for each level with tiles of its
